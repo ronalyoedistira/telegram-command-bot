@@ -9,7 +9,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
+import database
+
 TOKEN = os.getenv("BOT_TOKEN")
+
+
+def format_rupiah(angka: int) -> str:
+    """Ubah angka jadi format 'Rp 50.000'."""
+    return f"Rp {angka:,.0f}".replace(",", ".")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -191,6 +198,65 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ============================================================
+# HANDLER COMMAND TRANSAKSI (/masuk, /keluar, /reset_data)
+# ============================================================
+
+async def catat_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Format: /masuk 50000 Gaji bulanan"""
+    await _catat_transaksi(update, context, jenis="masuk")
+
+
+async def catat_keluar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Format: /keluar 20000 Makan siang"""
+    await _catat_transaksi(update, context, jenis="keluar")
+
+
+async def _catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE, jenis: str) -> None:
+    contoh = "/masuk 50000 Gaji bulanan" if jenis == "masuk" else "/keluar 20000 Makan siang"
+
+    if not context.args:
+        await update.message.reply_text(
+            f"⚠️ Format salah.\n\nContoh penggunaan:\n`{contoh}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    jumlah_str = context.args[0]
+    keterangan = " ".join(context.args[1:]) if len(context.args) > 1 else "-"
+
+    if not jumlah_str.isdigit():
+        await update.message.reply_text(
+            f"⚠️ Jumlah harus berupa angka bulat (tanpa titik/koma).\n\nContoh:\n`{contoh}`",
+            parse_mode="Markdown",
+        )
+        return
+
+    jumlah = int(jumlah_str)
+    user_id = update.effective_user.id
+    database.tambah_transaksi(user_id, jenis, jumlah, keterangan)
+    saldo_baru = database.get_saldo(user_id)
+
+    ikon = "🟢" if jenis == "masuk" else "🔴"
+    label = "Pemasukan" if jenis == "masuk" else "Pengeluaran"
+
+    await update.message.reply_text(
+        f"{ikon} *{label} tercatat*\n\n"
+        f"Jumlah: {format_rupiah(jumlah)}\n"
+        f"Keterangan: {keterangan}\n\n"
+        f"💰 Saldo sekarang: {format_rupiah(saldo_baru)}",
+        parse_mode="Markdown",
+    )
+
+
+async def reset_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    jumlah_dihapus = database.hapus_semua_data(user_id)
+    await update.message.reply_text(
+        f"🗑️ {jumlah_dihapus} transaksi Anda telah dihapus. Saldo kembali ke Rp 0."
+    )
+
+
+# ============================================================
 # HANDLER TOMBOL (CALLBACK QUERY)
 # ============================================================
 
@@ -227,30 +293,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # --- Menu fitur lain (masih placeholder, siap dikembangkan) ---
+    # --- Menu fitur lain (sekarang terhubung ke database asli) ---
+    user_id = query.from_user.id
+
     if data == "menu_laporan":
+        ringkasan = database.get_ringkasan_laporan(user_id, hari=30)
+        saldo = ringkasan["total_masuk"] - ringkasan["total_keluar"]
         text = (
-            "📊 *LAPORAN*\n\n"
-            "Fitur laporan belum terhubung ke database.\n\n"
-            "Tempat ini nantinya bisa digunakan untuk menampilkan laporan harian, bulanan, atau laporan keuangan."
+            "📊 *LAPORAN (30 HARI TERAKHIR)*\n\n"
+            f"🟢 Total Pemasukan : {format_rupiah(ringkasan['total_masuk'])}\n"
+            f"🔴 Total Pengeluaran : {format_rupiah(ringkasan['total_keluar'])}\n"
+            f"📈 Selisih (Net) : {format_rupiah(saldo)}\n"
+            f"🧾 Jumlah Transaksi : {ringkasan['jumlah_transaksi']} transaksi\n\n"
+            "Gunakan /masuk atau /keluar untuk mencatat transaksi baru."
         )
     elif data == "menu_saldo":
+        saldo = database.get_saldo(user_id)
         text = (
-            "💰 *SALDO*\n\n"
-            "Fitur saldo belum terhubung ke sumber data.\n\n"
-            "Nantinya bagian ini dapat mengambil saldo dari database atau sistem Anda."
+            "💰 *SALDO ANDA SAAT INI*\n\n"
+            f"{format_rupiah(saldo)}\n\n"
+            "Saldo dihitung dari seluruh riwayat pemasukan dikurangi pengeluaran yang tercatat."
         )
     elif data == "menu_transaksi":
-        text = (
-            "🧾 *TRANSAKSI*\n\n"
-            "Fitur transaksi belum terhubung ke database.\n\n"
-            "Nantinya kita dapat menambahkan transaksi masuk, transaksi keluar, pencarian, dan detail transaksi."
-        )
+        daftar = database.get_transaksi_terakhir(user_id, limit=5)
+        if not daftar:
+            text = (
+                "🧾 *TRANSAKSI TERAKHIR*\n\n"
+                "Belum ada transaksi tercatat.\n\n"
+                "Catat transaksi pertama Anda dengan:\n"
+                "`/masuk 50000 Gaji`\n"
+                "`/keluar 20000 Makan siang`"
+            )
+        else:
+            baris = []
+            for t in daftar:
+                ikon = "🟢" if t["jenis"] == "masuk" else "🔴"
+                tanggal = t["waktu"][:16].replace("T", " ")
+                ket = t["keterangan"] or "-"
+                baris.append(f"{ikon} {tanggal} — {format_rupiah(t['jumlah'])} ({ket})")
+            text = (
+                "🧾 *5 TRANSAKSI TERAKHIR*\n\n" + "\n".join(baris) +
+                "\n\nCatat transaksi baru dengan /masuk atau /keluar."
+            )
     elif data == "menu_data":
+        total = database.get_jumlah_data(user_id)
         text = (
             "📁 *DATA*\n\n"
-            "Fitur data belum terhubung ke database.\n\n"
-            "Nantinya dapat digunakan untuk melihat atau mengelola master data."
+            f"Total transaksi tersimpan: *{total}* baris\n\n"
+            "Command terkait data:\n"
+            "`/masuk <jumlah> <keterangan>` — catat pemasukan\n"
+            "`/keluar <jumlah> <keterangan>` — catat pengeluaran\n"
+            "`/reset_data` — hapus semua data Anda (tidak bisa dibatalkan)"
         )
     elif data == "menu_help":
         await query.edit_message_text(
@@ -309,12 +402,17 @@ def main() -> None:
             "BOT_TOKEN belum ditemukan. Atur environment variable BOT_TOKEN terlebih dahulu."
         )
 
+    database.init_db()
+
     application = ApplicationBuilder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("menu", menu))
     application.add_handler(CommandHandler("info", info_command))
+    application.add_handler(CommandHandler("masuk", catat_masuk))
+    application.add_handler(CommandHandler("keluar", catat_keluar))
+    application.add_handler(CommandHandler("reset_data", reset_data))
     application.add_handler(CallbackQueryHandler(button_handler))
 
     application.run_polling()
