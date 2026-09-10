@@ -8,15 +8,21 @@ Bot Telegram sederhana namun interaktif. Bot hanya menangani command tertentu da
 - `/menu` — menu utama
 - `/info` — menu **Info & Referensi** interaktif (istilah teknis, FAQ, tips keamanan, tentang bot)
 - `/help` — bantuan
-- `/masuk <jumlah> <keterangan>` — catat pemasukan (contoh: `/masuk 50000 Gaji`)
-- `/keluar <jumlah> <keterangan>` — catat pengeluaran (contoh: `/keluar 20000 Makan siang`)
-- `/reset_data` — hapus semua transaksi milik Anda
+- `/masuk <jumlah> <keterangan> #Kategori` — catat pemasukan (contoh: `/masuk 50000 Gaji #Gaji`, tag kategori opsional)
+- `/keluar <jumlah> <keterangan> #Kategori` — catat pengeluaran (contoh: `/keluar 20000 Makan siang #Makanan`, tag kategori opsional)
+- `/daftar` — lihat SEMUA transaksi beserta ID-nya
+- `/edit <id> <jumlah_baru> <keterangan_baru> #KategoriBaru` — ubah satu transaksi tertentu (contoh: `/edit 3 75000 Gaji plus bonus #Gaji`)
+- `/hapus <id>` — hapus satu transaksi tertentu (contoh: `/hapus 3`)
+- `/kategori` — ringkasan pemasukan & pengeluaran per kategori (30 hari terakhir)
+- `/export` — download semua transaksi sebagai file Excel (.xlsx)
+- `/reset_data` — hapus SEMUA transaksi milik Anda (tidak bisa dibatalkan)
 - Menu **Laporan, Saldo, Transaksi, Data** sudah terhubung ke database SQLite asli (bukan lagi placeholder) — datanya per pengguna (setiap orang yang chat bot ini punya data masing-masing)
 - Tombol inline untuk Laporan, Saldo, Transaksi, Data, Bantuan, dan Info & Referensi
 - Setiap topik di menu Info & Referensi berisi **konten asli yang bisa langsung dibaca** (bukan placeholder) — cocok dijadikan basis dokumentasi/FAQ bot Anda sendiri
 - Tombol kembali ke Menu Utama maupun ke Menu Info
 - Pesan teks biasa tidak diproses
 - Token bot dibaca dari environment variable `BOT_TOKEN`
+- Lokasi database bisa diatur lewat environment variable `DB_PATH` (untuk Railway Volume, lihat bagian di bawah)
 - Siap deploy dari GitHub ke Railway
 
 ## Struktur
@@ -105,6 +111,12 @@ Di Telegram coba:
 - `/keluar 20000 Makan siang` — lalu buka menu Laporan, harus muncul ringkasan masuk/keluar
 - Buka menu Transaksi — harus muncul 2 transaksi yang baru dicatat
 - `/reset_data` — lalu cek menu Saldo, harus kembali ke Rp 0
+- `/masuk 50000 Gaji #Gaji` lalu `/masuk 30000 Bonus #Sampingan` lalu `/keluar 10000 Jajan #Makanan` — lanjut `/daftar`, harus muncul 3 transaksi dengan ID dan kategori masing-masing
+- `/edit <id_salah_satu> 99000 Sudah diedit #Lainnya` — cek `/daftar` lagi, transaksi itu harus berubah jumlah, keterangan, dan kategorinya
+- `/hapus <id_salah_satu>` — cek `/daftar` lagi, transaksi itu harus hilang, dan yang lain tetap ada
+- Coba `/hapus 9999` (ID yang tidak ada) — harus muncul pesan "tidak ditemukan", bukan error
+- `/kategori` — harus muncul ringkasan per kategori (Gaji, Sampingan, Makanan, Lainnya) sesuai transaksi yang sudah dicatat
+- `/export` — bot harus mengirim file `.xlsx`, buka file itu dan pastikan datanya sesuai dengan `/daftar`
 
 Kemudian tekan tombol pada menu.
 
@@ -114,13 +126,44 @@ Kirim `halo` atau teks biasa. Bot tidak akan membalas karena tidak ada handler u
 
 Database memakai **SQLite** — tersimpan sebagai satu file `data.db` di folder project, dibuat otomatis saat `bot.py` pertama kali dijalankan (lewat `database.init_db()`). Tidak perlu instalasi database server terpisah.
 
-Setiap pengguna Telegram punya data masing-masing (dipisahkan berdasarkan `user_id`), jadi transaksi yang dicatat satu orang tidak akan tercampur dengan orang lain yang juga memakai bot ini.
+Setiap pengguna Telegram punya data masing-masing (dipisahkan berdasarkan `user_id`), jadi transaksi yang dicatat satu orang tidak akan tercampur dengan orang lain yang juga memakai bot ini. Ini juga berlaku untuk `/edit` dan `/hapus` — seseorang **tidak bisa** mengedit atau menghapus transaksi milik orang lain, walaupun tahu ID transaksinya (sudah dicek lewat kombinasi `id` + `user_id` di setiap query).
 
-**⚠️ Penting soal Railway:** sebagian besar hosting seperti Railway memakai *filesystem sementara* — artinya file `data.db` bisa **hilang setiap kali service di-restart atau di-deploy ulang**. Untuk penggunaan serius/produksi, ada 2 opsi:
-1. **Railway Volume** — tambahkan disk permanen di tab Settings > Volumes, lalu arahkan `DB_PATH` di `database.py` ke path volume tersebut (misalnya `/data/data.db`). ✅ Direkomendasikan.
-2. **Database eksternal** — ganti SQLite dengan PostgreSQL (Railway punya plugin PostgreSQL siap pakai) untuk skala lebih besar/multi-service.
+**⚠️ Penting soal Railway:** sebagian besar hosting seperti Railway memakai *filesystem sementara* — artinya file `data.db` bisa **hilang setiap kali service di-restart atau di-deploy ulang**. Untuk penggunaan serius/produksi, tambahkan **Railway Volume** (disk permanen):
 
-Untuk belajar dan penggunaan personal skala kecil, SQLite tanpa Volume sudah cukup — cuma perlu diingat datanya bisa reset kalau ada redeploy.
+### Cara setup Railway Volume (sudah didukung tanpa edit kode)
+
+1. Buka service bot di dashboard Railway
+2. Masuk tab **Settings** → scroll ke bagian **Volumes**
+3. Klik **New Volume**, isi *Mount Path* dengan: `/data`
+4. Buka tab **Variables**, tambahkan variable baru:
+   - Name: `DB_PATH`
+   - Value: `/data/data.db`
+5. Klik **Deploy** untuk redeploy dengan variable baru ini
+
+Karena `database.py` sudah membaca `DB_PATH` dari environment variable (`os.getenv("DB_PATH", "data.db")`), kamu **tidak perlu edit kode sama sekali** — cukup tambahkan Volume dan Variable di atas, dan data akan otomatis tersimpan permanen, aman dari redeploy berikutnya.
+
+> Kalau kamu tidak menambahkan variable `DB_PATH`, bot akan tetap otomatis pakai `data.db` di folder biasa (lokal atau di Railway tanpa Volume) — jadi ini murni opsional, tidak mengganggu yang sudah jalan kalau belum sempat di-setup.
+
+**Alternatif lain** (untuk skala lebih besar): ganti SQLite dengan PostgreSQL (Railway punya plugin PostgreSQL siap pakai) — tapi ini butuh perubahan kode di `database.py`, tidak sesederhana Volume di atas.
+
+## Tentang Kategori Transaksi
+
+Kategori bersifat **opsional** dan **backward-compatible** — command lama tanpa kategori (`/masuk 50000 Gaji`) tetap berfungsi normal, otomatis masuk kategori `Umum`.
+
+Untuk memberi kategori, tambahkan tag `#NamaKategori` di mana saja dalam command (biasanya di akhir):
+```text
+/masuk 50000 Gaji bulanan #Gaji
+/keluar 20000 Makan siang #Makanan
+/edit 3 75000 Sudah direvisi #Transport
+```
+
+Lihat ringkasan per kategori kapan saja dengan `/kategori`.
+
+**Migrasi otomatis:** kalau kamu sudah pakai bot ini sejak versi sebelumnya (v4 ke bawah, sebelum ada kolom kategori), `database.py` versi ini akan **otomatis menambahkan kolom kategori** ke database yang sudah ada saat pertama kali dijalankan — data lama tidak hilang, cuma otomatis diberi kategori `Umum`. Tidak perlu langkah manual apa pun.
+
+## Tentang Export ke Excel
+
+Command `/export` akan membuat file `.xlsx` berisi seluruh transaksi kamu (ID, tanggal, jenis, kategori, jumlah, keterangan) plus ringkasan total masuk/keluar/saldo di baris terakhir, lalu langsung dikirim sebagai file yang bisa didownload di Telegram. File sementara di server otomatis dihapus setelah terkirim.
 
 ## Menambah/Mengubah Konten Info & Referensi
 
@@ -208,10 +251,9 @@ Jika token bocor, cabut/ganti token melalui BotFather.
 Struktur ini siap diperluas menjadi:
 
 - login/admin
-- database PostgreSQL
-- laporan keuangan
-- saldo
-- transaksi
+- grafik/chart visual (pengeluaran per bulan, per kategori)
+- laporan keuangan periode custom (mingguan, per tanggal tertentu)
+- reminder otomatis (misal: pengingat catat pengeluaran harian)
 - webhook payment gateway
 - integrasi WhatsApp atau sistem lain
 

@@ -1,6 +1,10 @@
 import logging
 import os
+import tempfile
+from datetime import datetime
 
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -17,6 +21,47 @@ TOKEN = os.getenv("BOT_TOKEN")
 def format_rupiah(angka: int) -> str:
     """Ubah angka jadi format 'Rp 50.000'."""
     return f"Rp {angka:,.0f}".replace(",", ".")
+
+
+def buat_file_export(user_id: int, transaksi: list) -> str:
+    """Buat file .xlsx berisi seluruh transaksi milik user_id. Mengembalikan path file sementara."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transaksi"
+
+    header = ["ID", "Tanggal", "Jenis", "Kategori", "Jumlah (Rp)", "Keterangan"]
+    ws.append(header)
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="305496")
+
+    total_masuk = 0
+    total_keluar = 0
+    for t in transaksi:
+        tanggal = t["waktu"][:16].replace("T", " ")
+        jenis_label = "Masuk" if t["jenis"] == "masuk" else "Keluar"
+        ws.append([t["id"], tanggal, jenis_label, t["kategori"], t["jumlah"], t["keterangan"]])
+        if t["jenis"] == "masuk":
+            total_masuk += t["jumlah"]
+        else:
+            total_keluar += t["jumlah"]
+
+    ws.append([])
+    ws.append(["", "", "", "", "TOTAL MASUK", total_masuk])
+    ws.append(["", "", "", "", "TOTAL KELUAR", total_keluar])
+    ws.append(["", "", "", "", "SALDO", total_masuk - total_keluar])
+    for row in ws.iter_rows(min_row=ws.max_row - 2, max_row=ws.max_row):
+        for cell in row:
+            cell.font = Font(bold=True)
+
+    for col, width in zip("ABCDEF", [6, 18, 10, 16, 14, 30]):
+        ws.column_dimensions[col].width = width
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path_file = os.path.join(tempfile.gettempdir(), f"export_transaksi_{user_id}_{timestamp}.xlsx")
+    wb.save(path_file)
+    return path_file
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -202,27 +247,43 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ============================================================
 
 async def catat_masuk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Format: /masuk 50000 Gaji bulanan"""
+    """Format: /masuk 50000 Gaji bulanan #Gaji  (bagian #Kategori opsional, default 'Umum')"""
     await _catat_transaksi(update, context, jenis="masuk")
 
 
 async def catat_keluar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Format: /keluar 20000 Makan siang"""
+    """Format: /keluar 20000 Makan siang #Makanan  (bagian #Kategori opsional, default 'Umum')"""
     await _catat_transaksi(update, context, jenis="keluar")
 
 
+def _ekstrak_kategori(args: list) -> tuple:
+    """Cari token yang diawali '#' di antara args (contoh '#Makanan'), pisahkan dari keterangan.
+    Mengembalikan (kategori, args_tanpa_tag_kategori). Kalau tidak ada tag, kategori = None."""
+    kategori = None
+    sisa_args = []
+    for a in args:
+        if a.startswith("#") and len(a) > 1 and kategori is None:
+            kategori = a[1:]
+        else:
+            sisa_args.append(a)
+    return kategori, sisa_args
+
+
 async def _catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE, jenis: str) -> None:
-    contoh = "/masuk 50000 Gaji bulanan" if jenis == "masuk" else "/keluar 20000 Makan siang"
+    contoh = (
+        "/masuk 50000 Gaji bulanan #Gaji" if jenis == "masuk"
+        else "/keluar 20000 Makan siang #Makanan"
+    )
 
     if not context.args:
         await update.message.reply_text(
-            f"⚠️ Format salah.\n\nContoh penggunaan:\n`{contoh}`",
+            f"⚠️ Format salah.\n\nContoh penggunaan:\n`{contoh}`\n\n"
+            "Bagian `#Kategori` di akhir bersifat opsional — kalau tidak diisi, otomatis masuk kategori 'Umum'.",
             parse_mode="Markdown",
         )
         return
 
     jumlah_str = context.args[0]
-    keterangan = " ".join(context.args[1:]) if len(context.args) > 1 else "-"
 
     if not jumlah_str.isdigit():
         await update.message.reply_text(
@@ -231,9 +292,13 @@ async def _catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE, j
         )
         return
 
+    kategori, sisa_args = _ekstrak_kategori(context.args[1:])
+    keterangan = " ".join(sisa_args) if sisa_args else "-"
+    kategori = kategori or database.KATEGORI_DEFAULT
+
     jumlah = int(jumlah_str)
     user_id = update.effective_user.id
-    database.tambah_transaksi(user_id, jenis, jumlah, keterangan)
+    database.tambah_transaksi(user_id, jenis, jumlah, keterangan, kategori=kategori)
     saldo_baru = database.get_saldo(user_id)
 
     ikon = "🟢" if jenis == "masuk" else "🔴"
@@ -242,6 +307,7 @@ async def _catat_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE, j
     await update.message.reply_text(
         f"{ikon} *{label} tercatat*\n\n"
         f"Jumlah: {format_rupiah(jumlah)}\n"
+        f"Kategori: {kategori}\n"
         f"Keterangan: {keterangan}\n\n"
         f"💰 Saldo sekarang: {format_rupiah(saldo_baru)}",
         parse_mode="Markdown",
@@ -256,7 +322,169 @@ async def reset_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-# ============================================================
+async def daftar_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command /daftar — tampilkan SEMUA transaksi beserta ID-nya, supaya bisa dipakai di /edit atau /hapus."""
+    user_id = update.effective_user.id
+    semua = database.get_semua_transaksi(user_id)
+
+    if not semua:
+        await update.message.reply_text(
+            "📋 Belum ada transaksi tercatat.\n\nCatat dulu dengan `/masuk` atau `/keluar`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    baris = ["📋 *DAFTAR SEMUA TRANSAKSI*\n"]
+    for t in semua:
+        ikon = "🟢" if t["jenis"] == "masuk" else "🔴"
+        tanggal = t["waktu"][:16].replace("T", " ")
+        ket = t["keterangan"] or "-"
+        baris.append(f"`#{t['id']}` {ikon} {tanggal} — {format_rupiah(t['jumlah'])} ({ket})")
+
+    baris.append(
+        "\nGunakan ID (`#angka`) di atas untuk:\n"
+        "`/edit <id> <jumlah_baru> <keterangan_baru>`\n"
+        "`/hapus <id>`"
+    )
+
+    teks_lengkap = "\n".join(baris)
+
+    # Telegram membatasi ~4096 karakter per pesan; potong kalau terlalu panjang.
+    if len(teks_lengkap) > 4000:
+        teks_lengkap = teks_lengkap[:3900] + "\n\n... (daftar dipotong, terlalu banyak transaksi)"
+
+    await update.message.reply_text(teks_lengkap, parse_mode="Markdown")
+
+
+async def hapus_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Format: /hapus <id>"""
+    user_id = update.effective_user.id
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "⚠️ Format salah.\n\nContoh: `/hapus 3`\n\n"
+            "Cek dulu ID transaksinya lewat /daftar.",
+            parse_mode="Markdown",
+        )
+        return
+
+    transaksi_id = int(context.args[0])
+    berhasil = database.hapus_transaksi_by_id(transaksi_id, user_id)
+
+    if berhasil:
+        saldo_baru = database.get_saldo(user_id)
+        await update.message.reply_text(
+            f"🗑️ Transaksi `#{transaksi_id}` berhasil dihapus.\n\n"
+            f"💰 Saldo sekarang: {format_rupiah(saldo_baru)}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ Transaksi `#{transaksi_id}` tidak ditemukan, atau bukan milik Anda.\n\n"
+            "Cek ID yang benar lewat /daftar.",
+            parse_mode="Markdown",
+        )
+
+
+async def edit_transaksi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Format: /edit <id> <jumlah_baru> <keterangan_baru> #KategoriBaru (tag kategori opsional)"""
+    user_id = update.effective_user.id
+
+    if len(context.args) < 2 or not context.args[0].isdigit() or not context.args[1].isdigit():
+        await update.message.reply_text(
+            "⚠️ Format salah.\n\nContoh: `/edit 3 75000 Gaji plus bonus #Gaji`\n\n"
+            "Format: `/edit <id> <jumlah_baru> <keterangan_baru> #KategoriBaru`\n"
+            "Bagian `#KategoriBaru` opsional. Cek dulu ID transaksinya lewat /daftar.",
+            parse_mode="Markdown",
+        )
+        return
+
+    transaksi_id = int(context.args[0])
+    jumlah_baru = int(context.args[1])
+
+    kategori_baru, sisa_args = _ekstrak_kategori(context.args[2:])
+    keterangan_baru = " ".join(sisa_args) if sisa_args else None
+
+    berhasil = database.update_transaksi(
+        transaksi_id, user_id, jumlah=jumlah_baru, keterangan=keterangan_baru, kategori=kategori_baru
+    )
+
+    if berhasil:
+        data_terbaru = database.get_transaksi_by_id(transaksi_id, user_id)
+        saldo_baru = database.get_saldo(user_id)
+        await update.message.reply_text(
+            f"✏️ Transaksi `#{transaksi_id}` berhasil diubah.\n\n"
+            f"Jumlah baru: {format_rupiah(data_terbaru['jumlah'])}\n"
+            f"Kategori: {data_terbaru['kategori']}\n"
+            f"Keterangan baru: {data_terbaru['keterangan']}\n\n"
+            f"💰 Saldo sekarang: {format_rupiah(saldo_baru)}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"⚠️ Transaksi `#{transaksi_id}` tidak ditemukan, atau bukan milik Anda.\n\n"
+            "Cek ID yang benar lewat /daftar.",
+            parse_mode="Markdown",
+        )
+
+
+async def laporan_kategori(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command /kategori — ringkasan pemasukan & pengeluaran per kategori, 30 hari terakhir."""
+    user_id = update.effective_user.id
+    data = database.get_laporan_per_kategori(user_id, hari=30)
+
+    if not data:
+        await update.message.reply_text(
+            "📂 Belum ada transaksi dalam 30 hari terakhir untuk dibuat laporan kategori.\n\n"
+            "Catat transaksi dengan tag kategori, contoh:\n`/keluar 20000 Makan siang #Makanan`",
+            parse_mode="Markdown",
+        )
+        return
+
+    baris = ["📂 *LAPORAN PER KATEGORI (30 HARI TERAKHIR)*\n"]
+    for row in data:
+        net = row["total_masuk"] - row["total_keluar"]
+        baris.append(
+            f"*{row['kategori']}* ({row['jumlah_transaksi']}x)\n"
+            f"  🟢 Masuk: {format_rupiah(row['total_masuk'])}  |  🔴 Keluar: {format_rupiah(row['total_keluar'])}\n"
+            f"  Net: {format_rupiah(net)}"
+        )
+
+    baris.append(
+        "\nTips: tambahkan `#NamaKategori` di akhir command /masuk atau /keluar "
+        "untuk mengelompokkan transaksi, contoh:\n`/masuk 50000 Freelance #Sampingan`"
+    )
+
+    await update.message.reply_text("\n\n".join(baris), parse_mode="Markdown")
+
+
+async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Command /export — kirim semua transaksi sebagai file Excel (.xlsx) yang bisa didownload."""
+    user_id = update.effective_user.id
+    semua = database.get_semua_transaksi(user_id)
+
+    if not semua:
+        await update.message.reply_text(
+            "📤 Belum ada transaksi untuk di-export.\n\nCatat dulu dengan /masuk atau /keluar."
+        )
+        return
+
+    await update.message.reply_text("⏳ Menyiapkan file Excel...")
+
+    path_file = buat_file_export(user_id, semua)
+    try:
+        with open(path_file, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=os.path.basename(path_file),
+                caption=f"📤 Export {len(semua)} transaksi Anda.",
+            )
+    finally:
+        if os.path.exists(path_file):
+            os.remove(path_file)
+
+
+
 # HANDLER TOMBOL (CALLBACK QUERY)
 # ============================================================
 
@@ -305,7 +533,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"🔴 Total Pengeluaran : {format_rupiah(ringkasan['total_keluar'])}\n"
             f"📈 Selisih (Net) : {format_rupiah(saldo)}\n"
             f"🧾 Jumlah Transaksi : {ringkasan['jumlah_transaksi']} transaksi\n\n"
-            "Gunakan /masuk atau /keluar untuk mencatat transaksi baru."
+            "Gunakan /masuk atau /keluar untuk mencatat transaksi baru.\n"
+            "Lihat rincian per kategori dengan /kategori, atau download semua data dengan /export."
         )
     elif data == "menu_saldo":
         saldo = database.get_saldo(user_id)
@@ -321,8 +550,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 "🧾 *TRANSAKSI TERAKHIR*\n\n"
                 "Belum ada transaksi tercatat.\n\n"
                 "Catat transaksi pertama Anda dengan:\n"
-                "`/masuk 50000 Gaji`\n"
-                "`/keluar 20000 Makan siang`"
+                "`/masuk 50000 Gaji #Gaji`\n"
+                "`/keluar 20000 Makan siang #Makanan`"
             )
         else:
             baris = []
@@ -330,10 +559,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 ikon = "🟢" if t["jenis"] == "masuk" else "🔴"
                 tanggal = t["waktu"][:16].replace("T", " ")
                 ket = t["keterangan"] or "-"
-                baris.append(f"{ikon} {tanggal} — {format_rupiah(t['jumlah'])} ({ket})")
+                baris.append(f"{ikon} {tanggal} — {format_rupiah(t['jumlah'])} [{t['kategori']}] ({ket})")
             text = (
                 "🧾 *5 TRANSAKSI TERAKHIR*\n\n" + "\n".join(baris) +
-                "\n\nCatat transaksi baru dengan /masuk atau /keluar."
+                "\n\nCatat transaksi baru dengan /masuk atau /keluar. Lihat semua dengan /daftar."
             )
     elif data == "menu_data":
         total = database.get_jumlah_data(user_id)
@@ -341,9 +570,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "📁 *DATA*\n\n"
             f"Total transaksi tersimpan: *{total}* baris\n\n"
             "Command terkait data:\n"
-            "`/masuk <jumlah> <keterangan>` — catat pemasukan\n"
-            "`/keluar <jumlah> <keterangan>` — catat pengeluaran\n"
-            "`/reset_data` — hapus semua data Anda (tidak bisa dibatalkan)"
+            "`/masuk <jumlah> <ket> #Kategori` — catat pemasukan\n"
+            "`/keluar <jumlah> <ket> #Kategori` — catat pengeluaran\n"
+            "`/daftar` — lihat semua transaksi beserta ID-nya\n"
+            "`/edit <id> <jumlah> <ket> #Kategori` — ubah satu transaksi\n"
+            "`/hapus <id>` — hapus satu transaksi\n"
+            "`/kategori` — laporan ringkasan per kategori\n"
+            "`/export` — download semua data sebagai file Excel\n"
+            "`/reset_data` — hapus SEMUA data (tidak bisa dibatalkan)"
         )
     elif data == "menu_help":
         await query.edit_message_text(
@@ -413,6 +647,11 @@ def main() -> None:
     application.add_handler(CommandHandler("masuk", catat_masuk))
     application.add_handler(CommandHandler("keluar", catat_keluar))
     application.add_handler(CommandHandler("reset_data", reset_data))
+    application.add_handler(CommandHandler("daftar", daftar_transaksi))
+    application.add_handler(CommandHandler("hapus", hapus_transaksi))
+    application.add_handler(CommandHandler("edit", edit_transaksi))
+    application.add_handler(CommandHandler("kategori", laporan_kategori))
+    application.add_handler(CommandHandler("export", export_data))
     application.add_handler(CallbackQueryHandler(button_handler))
 
     application.run_polling()
